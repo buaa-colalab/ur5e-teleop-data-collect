@@ -1,0 +1,66 @@
+record:
+  repo_id: &repo_id "colab/ur5e_transfer_wafer" # huggingface repo: <hf_username>/<dataset_repo_id>
+  fps: 25 # dataset and camera frame rate
+
+  robot:
+    ip: &ip "192.168.31.123" # robot ip
+    enable_gripper: &enable_gripper True # disable until AG95 is installed
+    gripper_port: &gripper_port "/dev/ttyUSB0" # AG95 gripper port
+    gripper_open: &gripper_open 0
+    gripper_close: &gripper_close 1000
+    servo_speed: 0.1
+    servo_accel: 0.1
+    servo_lookahead_time: 0.1
+    servo_gain: 500
+
+  teleop:
+    port: "/dev/ttyACM0" # master-arm serial port
+    joint_coef: [1.0, -1.0, -1.0, -1.0, -1.0, -1.0]
+    resync_key: "s"
+    resync_settle_seconds: 0.2
+    gripper_trigger_threshold: 400.0
+    use_gripper: True
+
+  task:
+    description: "Push the wafer into the slot." # task description
+    num_episodes: 2 # number of episodes to record
+    display: True # whether to display the data during recording
+    resume: False
+    teleop_init_joint: [-2.6177242437945765, -2.009850164453024, 2.4285362402545374, -0.4312353891185303, 1.307356834411621, 0]
+    keyboard_init_joint: [-2.6177242437945765, -2.009850164453024, 2.4285362402545374, -0.4312353891185303, 1.307356834411621, 0]
+    close_gripper_before_recording: False # True 时在正式录制前执行一次不写入数据集的闭夹爪动作
+
+  time:
+    episode_time_sec: 3000 # max time per episode in seconds
+    reset_time_sec: 60 # max time to reset between episodes in seconds
+    save_meta_period: 1 # save metadata after every N episodes
+
+  cameras:
+    enable: False # false 时不打开 OpenCV 相机，改为使用 mock 图像
+    wrist:
+      source: "0" # OpenCV source: camera index, /dev/video path, or network stream URL
+      width: 1280
+      height: 720
+      rotation: 0
+    exterior:
+      source: "2" # OpenCV source: camera index, /dev/video path, or network stream URL
+      width: 1280
+      height: 720
+      rotation: 0
+
+  storage:
+    push_to_hub: False # whether to push the dataset to your huggingface repo after recording
+
+replay:
+  repo_id: *repo_id
+  episode_idx: 0 # episode index to replay
+  robot:
+    ip: *ip
+    enable_gripper: *enable_gripper
+    gripper_port: *gripper_port
+    gripper_open: *gripper_open
+    gripper_close: *gripper_close
+
+visualize:
+  repo_id: *repo_id
+  episode_index: 0 # episode index to visualize
