@@ -73,3 +73,8 @@ scripts/convert.py可将所采数据转化为Pi0训练所需的格式。
 python scripts/convert.py --input /home/user/project_0418/data/ur5e_transfer_wafer_part_2 --output-dir /home/user/project_0418/data/ur5e_transfer_wafer_part_2_v21
 ```
 若要转换为其他格式，可自行参考 `scripts/convert.py` 编写。
+
+# Contributors
+- [Yige Mao](https://github.com/yigesmx)
+- [Xingyu Peng](https://github.com/GradiusTwinbee)
+- [Linqing Zhong](#)
