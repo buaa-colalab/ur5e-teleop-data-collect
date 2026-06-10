@@ -59,7 +59,8 @@ def build_gripper_action(is_open: bool) -> dict[str, float]:
 
 
 def build_camera_config(camera_cfg: dict[str, Any], fps: int,
-                        enabled: bool) -> CameraConfig:
+                        enabled: bool = True) -> CameraConfig:
+    enabled = bool(camera_cfg.get("enable", enabled))
     if not enabled:
         return MockCameraConfig(
             fps=fps,

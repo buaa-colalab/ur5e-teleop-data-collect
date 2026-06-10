@@ -1,20 +1,20 @@
 record:
-  repo_id: &repo_id "zgca/pour_water" # huggingface repo: <hf_username>/<dataset_repo_id>
+  repo_id: &repo_id "buaa/test" # huggingface repo: <hf_username>/<dataset_repo_id>
   fps: 30 # dataset and camera frame rate
 
   robot:
-    ip: &ip "192.168.119.3" # robot ip
+    ip: &ip "192.168.31.123" # robot ip
     enable_gripper: &enable_gripper True
-    gripper_init_open: &gripper_init_open False # 初始化到初始位姿后，夹爪是否保持打开
+    gripper_init_open: &gripper_init_open True # 初始化到初始位姿后，夹爪是否保持打开
     gripper: &gripper
-      choice: robotiq # one of: robotiq, dh, qb
+      choice: dh # one of: robotiq, dh, qb
       qb:
         port: "/dev/ttyUSB0"
         device_id: 1
         open: [0, 0]
         close: [10000, 0]
       dh:
-        port: "/dev/ttyUSB0"
+        port: "/dev/ur5e/dh_gripper_0"
         force: 100
         open: 1000
         close: 0
@@ -31,7 +31,7 @@ record:
     servo_gain: 500
 
   teleop:
-    port: "/dev/ttyACM0" # master-arm serial port
+    port: "/dev/ur5e/ur5e_teleop_0" # master-arm serial port
     joint_coef: [1.0, -1.0, -1.0, -1.0, -1.0, -1.0]
     resync_key: "s"
     resync_settle_seconds: 0.2
@@ -53,16 +53,17 @@ record:
     save_meta_period: 1 # save metadata after every N episodes
 
   cameras:
-    enable: True # false 时不打开 OpenCV 相机，改为使用 mock 图像
     storage_width: 640  # 存储图像宽度 (480p: 854x480)
     storage_height: 360  # 存储图像高度
     wrist:
-      source: "2" # OpenCV source: camera index, /dev/video path, or network stream URL
+      enable: True # True 使用真实 OpenCV 相机，False 使用 mock 图像
+      source: "/dev/ur5e/dji_osmo_action5pro_0" # OpenCV source: camera index, /dev/video path, or network stream URL
       width: 1280
       height: 720
       rotation: 0
     exterior:
-      source: "0" # OpenCV source: camera index, /dev/video path, or network stream URL
+      enable: False # True 使用真实 OpenCV 相机，False 使用 mock 图像
+      source: "/dev/ur5e/dji_osmo_action5pro_1" # OpenCV source: camera index, /dev/video path, or network stream URL
       width: 1280
       height: 720
       rotation: 0
