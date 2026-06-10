@@ -11,6 +11,14 @@ from lerobot.teleoperators.teleoperator import Teleoperator
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
 from .config_teleop import UR5eTeleopConfig
+from .pose_utils import (
+    format_python_list,
+    rotvec_to_rpy,
+    rotvec_to_matrix,
+    axis_rotation_matrix,
+    matrix_to_rpy,
+    wrap_to_pi,
+)
 
 PYNPUT_AVAILABLE = True
 try:
@@ -30,77 +38,6 @@ except Exception as exc:  # pragma: no cover - environment dependent
 logger = logging.getLogger(__name__)
 
 
-def _format_python_list(values: np.ndarray) -> str:
-    return np.array2string(
-        values,
-        precision=4,
-        separator=", ",
-        max_line_width=100000,
-    )
-
-
-def _skew(vector: np.ndarray) -> np.ndarray:
-    return np.array(
-        [
-            [0.0, -vector[2], vector[1]],
-            [vector[2], 0.0, -vector[0]],
-            [-vector[1], vector[0], 0.0],
-        ],
-        dtype=float,
-    )
-
-
-def _rotvec_to_matrix(rotvec: np.ndarray) -> np.ndarray:
-    theta = float(np.linalg.norm(rotvec))
-    if theta < 1e-12:
-        return np.eye(3)
-
-    axis = rotvec / theta
-    skew_axis = _skew(axis)
-    return (
-        np.eye(3)
-        + np.sin(theta) * skew_axis
-        + (1.0 - np.cos(theta)) * (skew_axis @ skew_axis)
-    )
-
-
-def _matrix_to_rpy(matrix: np.ndarray) -> np.ndarray:
-    pitch = float(np.arcsin(np.clip(-matrix[2, 0], -1.0, 1.0)))
-    cos_pitch = float(np.cos(pitch))
-
-    if abs(cos_pitch) < 1e-8:
-        roll = float(np.arctan2(-matrix[1, 2], matrix[1, 1]))
-        yaw = 0.0
-    else:
-        roll = float(np.arctan2(matrix[2, 1], matrix[2, 2]))
-        yaw = float(np.arctan2(matrix[1, 0], matrix[0, 0]))
-
-    return np.array([roll, pitch, yaw], dtype=float)
-
-
-def _rotvec_to_rpy(rotvec: np.ndarray) -> np.ndarray:
-    return _matrix_to_rpy(_rotvec_to_matrix(rotvec))
-
-
-def _axis_rotation_matrix(axis: np.ndarray, angle: float) -> np.ndarray:
-    axis = np.asarray(axis, dtype=float)
-    axis_norm = float(np.linalg.norm(axis))
-    if axis_norm < 1e-12 or abs(angle) < 1e-12:
-        return np.eye(3)
-
-    unit_axis = axis / axis_norm
-    skew_axis = _skew(unit_axis)
-    return (
-        np.eye(3)
-        + np.sin(angle) * skew_axis
-        + (1.0 - np.cos(angle)) * (skew_axis @ skew_axis)
-    )
-
-
-def _wrap_to_pi(angle: float) -> float:
-    return float((angle + np.pi) % (2.0 * np.pi) - np.pi)
-
-
 class UR5eTeleopKB(Teleoperator):
     config_class = UR5eTeleopConfig
     name = "ur5e_keyboard"
@@ -116,7 +53,8 @@ class UR5eTeleopKB(Teleoperator):
 
     @property
     def action_features(self) -> dict:
-        return {
+        features = {f"joint_{idx}.pos": float for idx in range(1, 7)}
+        features.update({
             "tcp_pose.x": float,
             "tcp_pose.y": float,
             "tcp_pose.z": float,
@@ -124,7 +62,8 @@ class UR5eTeleopKB(Teleoperator):
             "tcp_pose.pitch": float,
             "tcp_pose.yaw": float,
             "gripper_position": float,
-        }
+        })
+        return features
 
     @property
     def feedback_features(self) -> dict:
@@ -231,12 +170,12 @@ class UR5eTeleopKB(Teleoperator):
     def print_current_robot_state(self) -> None:
         joint_positions = self.get_robot_joint_positions()
         tcp_pose = self.get_robot_tcp_pose()
-        tcp_rpy = _rotvec_to_rpy(tcp_pose[3:])
+        tcp_rpy = rotvec_to_rpy(tcp_pose[3:])
 
         print("\n===== Current Robot State =====")
-        print(f"joint = {_format_python_list(joint_positions)}")
-        print(f"tcp = {_format_python_list(tcp_pose)}")
-        print(f"rpy = {_format_python_list(tcp_rpy)}")
+        print(f"joint = {format_python_list(joint_positions)}")
+        print(f"tcp = {format_python_list(tcp_pose)}")
+        print(f"rpy = {format_python_list(tcp_rpy)}")
         print("================================\n")
 
     def get_robot_tcp_pose(self) -> np.ndarray:
@@ -266,7 +205,7 @@ class UR5eTeleopKB(Teleoperator):
             self.print_current_robot_state()
 
         tcp_pose = self.get_robot_tcp_pose()
-        current_rotation = _rotvec_to_matrix(tcp_pose[3:])
+        current_rotation = rotvec_to_matrix(tcp_pose[3:])
 
         linear_step = float(self.config.keyboard_linear_step)
         angular_step = float(self.config.keyboard_angular_step)
@@ -298,9 +237,9 @@ class UR5eTeleopKB(Teleoperator):
         )
 
         delta_rotation = (
-            _axis_rotation_matrix(np.array([1.0, 0.0, 0.0]), delta_roll)
-            @ _axis_rotation_matrix(np.array([0.0, 1.0, 0.0]), delta_pitch)
-            @ _axis_rotation_matrix(np.array([0.0, 0.0, 1.0]), delta_yaw)
+            axis_rotation_matrix(np.array([1.0, 0.0, 0.0]), delta_roll)
+            @ axis_rotation_matrix(np.array([0.0, 1.0, 0.0]), delta_pitch)
+            @ axis_rotation_matrix(np.array([0.0, 0.0, 1.0]), delta_yaw)
         )
 
         target_position = tcp_pose[:3] + np.array(
@@ -310,10 +249,23 @@ class UR5eTeleopKB(Teleoperator):
         # Apply orientation increments in the tool-local frame so each key
         # consistently rotates around the end-effector's current x/y/z axes.
         target_rotation = current_rotation @ delta_rotation
-        target_rpy = _matrix_to_rpy(target_rotation)
-        target_rpy = np.array([_wrap_to_pi(angle) for angle in target_rpy], dtype=float)
+        target_rpy = matrix_to_rpy(target_rotation)
+        target_rpy = np.array([wrap_to_pi(angle) for angle in target_rpy], dtype=float)
+
+        # Get current robot joint positions
+        try:
+            current_joint = self.get_robot_joint_positions()
+        except Exception:
+            # Fallback if joint reading fails
+            current_joint = np.zeros(6)
 
         return {
+            "joint_1.pos": float(current_joint[0]),
+            "joint_2.pos": float(current_joint[1]),
+            "joint_3.pos": float(current_joint[2]),
+            "joint_4.pos": float(current_joint[3]),
+            "joint_5.pos": float(current_joint[4]),
+            "joint_6.pos": float(current_joint[5]),
             "tcp_pose.x": float(target_position[0]),
             "tcp_pose.y": float(target_position[1]),
             "tcp_pose.z": float(target_position[2]),

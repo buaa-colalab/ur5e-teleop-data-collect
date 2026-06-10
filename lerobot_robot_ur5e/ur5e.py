@@ -11,12 +11,8 @@ from lerobot.cameras import make_cameras_from_configs
 from lerobot.robots.robot import Robot
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
-try:
-    from pyDHgripper import AG95
-except ImportError:  # pragma: no cover - hardware dependency
-    AG95 = None
-
 from .config_ur5e import UR5eConfig
+from .lab_gripper import LabGripper
 
 logger = logging.getLogger(__name__)
 
@@ -127,11 +123,17 @@ class UR5e(Robot):
         super().__init__(config)
         self.cameras = make_cameras_from_configs(config.cameras)
         self.config = config
+        if self.config.control_mode not in {"joint", "tcp"}:
+            raise ValueError(
+                f"Unsupported control_mode={self.config.control_mode!r}. "
+                "Expected 'joint' or 'tcp'."
+            )
         self._is_connected = False
         self._arm = {}
         self._gripper = None
         self._prev_observation = None
-        self._gripper_command = 1.0
+        self._gripper_command = 0.0 if config.gripper_init_open else 1.0
+        self._gripper_position = None
         self._gripper_lock = threading.Lock()
         self._stop_gripper_reader = threading.Event()
 
@@ -143,10 +145,9 @@ class UR5e(Robot):
         self._arm["rtde_r"], self._arm["rtde_c"] = self._check_ur5e_connection(
             self.config.robot_ip)
         if self.config.enable_gripper:
-            self._gripper = self._check_gripper_connection(
-                self.config.gripper_port)
-            self._gripper_command = self._raw_gripper_to_normalized(
-                self.config.gripper_close)
+            self._gripper = self._check_gripper_connection()
+            self._gripper_command = 0.0 if self.config.gripper_init_open else 1.0
+            self._stop_gripper_reader.clear()
             self._start_gripper_state_reader()
         else:
             self._gripper = None
@@ -162,16 +163,19 @@ class UR5e(Robot):
         print(
             f"[INFO] {self.name} env initialization completed successfully.\n")
 
-    def _check_gripper_connection(self, port: str):
-        print("\n[GRIPPER] Initializing AG95 gripper...")
-        if AG95 is None:
-            raise ImportError(
-                "pyDHgripper.AG95 is required for the AG95 gripper integration"
+    def _check_gripper_connection(self):
+        gripper_cfg = getattr(self.config, "gripper", None)
+        if gripper_cfg:
+            gripper = LabGripper(gripper_cfg, robot_ip=self.config.robot_ip)
+        else:
+            gripper = LabGripper.from_legacy_config(
+                robot_ip=self.config.robot_ip,
+                gripper_port=self.config.gripper_port,
+                gripper_open=self.config.gripper_open,
+                gripper_close=self.config.gripper_close,
+                gripper_force=self.config.gripper_force,
             )
-        gripper = AG95(port)
-        gripper.init_feedback()
-        gripper.set_force(100)
-        print("[GRIPPER] Gripper initialized successfully.\n")
+        gripper.connect()
         return gripper
 
     def _check_ur5e_connection(self, robot_ip: str):
@@ -202,31 +206,22 @@ class UR5e(Robot):
     def _read_gripper_state(self):
         if self._gripper is None:
             return
-        self._gripper.pos = None
+
+        try:
+            self._gripper_position = self._gripper.get_position()
+        except Exception:
+            self._gripper_position = None
+
         last_command = None
         while not self._stop_gripper_reader.is_set():
             with self._gripper_lock:
                 command = self._gripper_command
-            raw_command = self._normalized_gripper_to_raw(command)
-            if raw_command != last_command:
-                self._gripper.set_pos(val=raw_command)
-                last_command = raw_command
-            self._gripper.pos = self._gripper.read_pos()
+            if command != last_command:
+                self._gripper.set_position(command)
+                last_command = command
+
+            self._gripper_position = self._gripper.get_position()
             time.sleep(0.02)
-
-    def _normalized_gripper_to_raw(self, value: float) -> int:
-        clamped = max(0.0, min(1.0, float(value)))
-        span = self.config.gripper_close - self.config.gripper_open
-        return int(round(self.config.gripper_open + span * clamped))
-
-    def _raw_gripper_to_normalized(self, value: float | None) -> float:
-        if value is None:
-            return 0.0
-        span = self.config.gripper_close - self.config.gripper_open
-        if span == 0:
-            return 0.0
-        return max(0.0,
-                   min(1.0, (float(value) - self.config.gripper_open) / span))
 
     def _extract_joint_position_action(
             self, action: dict[str, Any]) -> list[float] | None:
@@ -286,8 +281,72 @@ class UR5e(Robot):
             "joint_4.pos": float,
             "joint_5.pos": float,
             "joint_6.pos": float,
+            "tcp_pose.x": float,
+            "tcp_pose.y": float,
+            "tcp_pose.z": float,
+            "tcp_pose.roll": float,
+            "tcp_pose.pitch": float,
+            "tcp_pose.yaw": float,
             "gripper_position": float,
         }
+
+    def _send_joint_command(self, joint_position: list[float], move_slow: bool = False) -> None:
+        if not move_slow:
+            t_start = self._arm["rtde_c"].initPeriod()
+            self._arm["rtde_c"].servoJ(
+                joint_position,
+                self.config.servo_speed,
+                self.config.servo_accel,
+                self.config.control_period_s,
+                self.config.servo_lookahead_time,
+                self.config.servo_gain,
+            )
+            self._arm["rtde_c"].waitPeriod(t_start)
+        else:
+            t_start = self._arm["rtde_c"].initPeriod()
+            self._arm["rtde_c"].servoJ(
+                joint_position,
+                0.01,
+                0.01,
+                2,
+                0.2,
+                200,
+            )
+            self._arm["rtde_c"].waitPeriod(t_start)
+
+    def _send_tcp_command(self, tcp_pose: list[float], move_slow: bool = False) -> None:
+        if not move_slow:
+            t_start = self._arm["rtde_c"].initPeriod()
+            self._arm["rtde_c"].servoL(
+                tcp_pose,
+                self.config.servo_speed,
+                self.config.servo_accel,
+                self.config.control_period_s,
+                self.config.servo_lookahead_time,
+                self.config.servo_gain,
+            )
+            self._arm["rtde_c"].waitPeriod(t_start)
+        else:
+            t_start = self._arm["rtde_c"].initPeriod()
+            self._arm["rtde_c"].servoL(
+                tcp_pose,
+                0.01,
+                0.01,
+                2.0,
+                0.2,
+                400,
+            )
+            self._arm["rtde_c"].waitPeriod(t_start)
+
+    def send_joint_action(self, joint_position: list[float], move_slow: bool = False) -> None:
+        if len(joint_position) != 6:
+            raise ValueError(f"joint_position must have 6 values, got {len(joint_position)}")
+        self._send_joint_command([float(v) for v in joint_position], move_slow=move_slow)
+
+    def send_tcp_action(self, tcp_pose: list[float], move_slow: bool = False) -> None:
+        if len(tcp_pose) != 6:
+            raise ValueError(f"tcp_pose must have 6 values, got {len(tcp_pose)}")
+        self._send_tcp_command([float(v) for v in tcp_pose], move_slow=move_slow)
 
     def send_action(self, action: dict[str, Any], move_slow=False) -> dict[str, Any]:
         if not self.is_connected:
@@ -295,57 +354,30 @@ class UR5e(Robot):
 
         joint_position = self._extract_joint_position_action(action)
         tcp_pose = self._extract_tcp_pose_action(action)
-        if joint_position is not None:
-            if not move_slow:
-                t_start = self._arm["rtde_c"].initPeriod()
-                self._arm["rtde_c"].servoJ(
-                    joint_position,
-                    self.config.servo_speed,
-                    self.config.servo_accel,
-                    self.config.control_period_s,
-                    self.config.servo_lookahead_time,
-                    self.config.servo_gain,
-                )
-                self._arm["rtde_c"].waitPeriod(t_start)
-            else:
-                t_start = self._arm["rtde_c"].initPeriod()
-                self._arm["rtde_c"].servoJ(
-                    joint_position,
-                    0.01,
-                    0.01,
-                    2,
-                    0.2,
-                    200,
-                )
-                self._arm["rtde_c"].waitPeriod(t_start)
-        elif tcp_pose is not None:
-            if not move_slow:
-                t_start = self._arm["rtde_c"].initPeriod()
-                self._arm["rtde_c"].servoL(
-                    tcp_pose,
-                    self.config.servo_speed,
-                    self.config.servo_accel,
-                    self.config.control_period_s,
-                    self.config.servo_lookahead_time,
-                    self.config.servo_gain,
-                )
-                self._arm["rtde_c"].waitPeriod(t_start)
-            else:
-                t_start = self._arm["rtde_c"].initPeriod()
-                self._arm["rtde_c"].servoL(
-                    tcp_pose,
-                    0.01,
-                    0.01,
-                    2.0,
-                    0.2,
-                    400,
-                )
-                self._arm["rtde_c"].waitPeriod(t_start)
+        has_gripper = "gripper_position" in action
+        has_motion = (joint_position is not None) or (tcp_pose is not None)
 
-        if "gripper_position" in action:
-            if self.config.enable_gripper:
-                with self._gripper_lock:
-                    self._gripper_command = float(action["gripper_position"])
+        if has_motion:
+            if self.config.control_mode == "joint":
+                if joint_position is None:
+                    raise ValueError(
+                        "Robot is configured for joint control, but action does not contain joint fields."
+                    )
+                self._send_joint_command(joint_position, move_slow=move_slow)
+            else:
+                if tcp_pose is None:
+                    raise ValueError(
+                        "Robot is configured for tcp control, but action does not contain tcp_pose fields."
+                    )
+                self._send_tcp_command(tcp_pose, move_slow=move_slow)
+        elif not has_gripper:
+            raise ValueError(
+                "Action does not contain valid motion fields or gripper_position."
+            )
+
+        if has_gripper and self.config.enable_gripper:
+            with self._gripper_lock:
+                self._gripper_command = float(action["gripper_position"])
 
         return action
 
@@ -368,8 +400,11 @@ class UR5e(Robot):
             obs_dict[f"tcp_pose.{axis}"] = float(tcp_rpy[i])
 
         if self.config.enable_gripper and self._gripper is not None:
-            obs_dict["gripper_position"] = self._raw_gripper_to_normalized(
-                self._gripper.pos)
+            obs_dict["gripper_position"] = float(
+                self._gripper_position
+                if self._gripper_position is not None
+                else self._gripper.get_position()
+            )
         else:
             obs_dict["gripper_position"] = 0.0
 
@@ -402,8 +437,8 @@ class UR5e(Robot):
 
         if self._gripper is not None:
             try:
-                self._gripper.close()
-            except AttributeError:
+                self._gripper.disconnect()
+            except Exception:
                 pass
 
         for cam in self.cameras.values():

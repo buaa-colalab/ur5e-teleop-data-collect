@@ -1,6 +1,11 @@
-import time
+import sys, time
 import yaml
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from typing import Dict, Any
 from lerobot_robot_ur5e import UR5eConfig, UR5e
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -19,9 +24,23 @@ class ReplayConfig:
         # robot config
         self.robot_ip: str = robot["ip"]
         self.enable_gripper: bool = bool(robot.get("enable_gripper", True))
-        self.gripper_port: str = robot["gripper_port"]
-        self.gripper_open: int = robot.get("gripper_open", 0)
-        self.gripper_close: int = robot.get("gripper_close", 1000)
+        self.gripper_port: int = int(robot.get("gripper_port", 63352))
+        self.gripper_open: int = int(robot.get("gripper_open", 0))
+        self.gripper_close: int = int(robot.get("gripper_close", 255))
+        self.gripper_force: int = int(robot.get("gripper_force", 255))
+        self.gripper_init_open: bool = bool(
+            robot.get("gripper_init_open", False)
+        )
+        self.gripper: dict[str, Any] = robot.get("gripper", {
+            "choice": "robotiq",
+            "robotiq": {
+                "ip": self.robot_ip,
+                "port": self.gripper_port,
+                "force": self.gripper_force,
+                "open": self.gripper_open,
+                "close": self.gripper_close,
+            },
+        })
 
 
 def main(replay_cfg: ReplayConfig):
@@ -30,20 +49,16 @@ def main(replay_cfg: ReplayConfig):
     robot_config = UR5eConfig(
         robot_ip=replay_cfg.robot_ip,
         enable_gripper=replay_cfg.enable_gripper,
-        gripper_port=replay_cfg.gripper_port,
-        gripper_open=replay_cfg.gripper_open,
-        gripper_close=replay_cfg.gripper_close,
+        gripper=replay_cfg.gripper,
+        gripper_init_open=replay_cfg.gripper_init_open,
     )
 
     robot = robot = UR5e(robot_config)
     robot.connect()
 
-    pre_init_joint = [-2.6177242437945765, -2.009850164453024, 2.4285362402545374, -0.4312353891185303, 1.307356834411621, -1.5594866911517542]
-    robot._arm["rtde_c"].moveJ(pre_init_joint, speed = 0.2, acceleration = 1)
-    init_joint = [-1.8511, -1.0227, 1.9796, -0.9966, 1.2703, -1.5801]
+    init_joint = [-1.6285174528705042, -1.6196133098998011, 2.112854782735006, -0.43745441854510503, 1.5982029438018799, 0]
     robot._arm["rtde_c"].moveJ(init_joint, speed = 0.2, acceleration = 1)
-    robot._gripper.set_force(100) # min
-    robot._gripper.set_pos(1000) # min
+    robot.send_action({"gripper_position": 0.0 if replay_cfg.gripper_init_open else 1.0})
     time.sleep(3)
 
     dataset = LeRobotDataset(replay_cfg.repo_id, episodes=[episode_idx])

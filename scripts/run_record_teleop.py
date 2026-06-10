@@ -17,6 +17,8 @@ from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.utils import hw_to_dataset_features
 from lerobot.processor import make_default_processors
+from lerobot.processor.pipeline import IdentityProcessorStep, RobotProcessorPipeline, ObservationProcessorStep
+from lerobot.processor.converters import observation_to_transition, transition_to_observation
 from lerobot.scripts.lerobot_record import record_loop
 from lerobot.utils.control_utils import init_keyboard_listener
 from lerobot.utils.control_utils import sanity_check_dataset_robot_compatibility
@@ -48,8 +50,12 @@ def build_joint_action(joint_values: list[float]) -> dict[str, float]:
         f"joint_{idx + 1}.pos": float(joint)
         for idx, joint in enumerate(joint_values)
     }
-    action["gripper_position"] = 1000.0
+    action["gripper_position"] = 1.0
     return action
+
+
+def build_gripper_action(is_open: bool) -> dict[str, float]:
+    return {"gripper_position": 0.0 if is_open else 1.0}
 
 
 def build_camera_config(camera_cfg: dict[str, Any], fps: int,
@@ -79,6 +85,80 @@ def print_keymap(teleop: UR5eTeleop) -> None:
     print("==================\n")
 
 
+class ImageResizeProcessorStep(ObservationProcessorStep):
+    """Simple image resizing processor step."""
+    
+    def __init__(self, resize_size: tuple[int, int] | None = None):
+        self.resize_size = resize_size
+    
+    def observation(self, observation: dict) -> dict:
+        if self.resize_size is None:
+            return observation
+        
+        import cv2
+        import numpy as np
+        import torch
+        from torchvision.transforms import functional as F
+        
+        new_observation = dict(observation)
+        for key in observation:
+            if "image" not in key:
+                continue
+            
+            image = observation[key]
+            
+            # Resize if needed
+            if isinstance(image, np.ndarray):
+                if image.ndim >= 2 and tuple(image.shape[:2]) != self.resize_size:
+                    target_h, target_w = self.resize_size
+                    image = cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_AREA)
+                    new_observation[key] = image
+            elif isinstance(image, torch.Tensor) and image.shape[-2:] != self.resize_size:
+                image = F.resize(image, self.resize_size)
+                new_observation[key] = image
+        
+        return new_observation
+    
+    def get_config(self) -> dict[str, Any]:
+        return {"resize_size": self.resize_size}
+    
+    def transform_features(self, features):
+        return features
+
+
+def make_robot_observation_processor_with_resize(
+    storage_size: tuple[int, int] | None = None,
+) -> RobotProcessorPipeline:
+    """Create observation processor with optional image resizing.
+    
+    Args:
+        storage_size: Tuple of (height, width) to resize images to, or None for no resizing
+    
+    Returns:
+        RobotProcessorPipeline with image resizing step if storage_size is provided
+    """
+    steps = [IdentityProcessorStep()]
+    
+    if storage_size is not None:
+        steps.append(ImageResizeProcessorStep(resize_size=storage_size))
+    
+    robot_observation_processor = RobotProcessorPipeline(
+        steps=steps,
+        to_transition=observation_to_transition,
+        to_output=transition_to_observation,
+    )
+    return robot_observation_processor
+
+
+def update_observation_image_feature_shapes(
+    obs_features: dict[str, dict], storage_height: int, storage_width: int
+) -> dict[str, dict]:
+    for key, ft in obs_features.items():
+        if key.startswith("observation.images.") and isinstance(ft, dict):
+            ft["shape"] = (storage_height, storage_width, 3)
+    return obs_features
+
+
 class RecordConfig:
     def __init__(self, cfg: dict[str, Any]):
         storage = cfg["storage"]
@@ -93,9 +173,23 @@ class RecordConfig:
 
         self.robot_ip: str = robot_cfg["ip"]
         self.enable_gripper: bool = bool(robot_cfg.get("enable_gripper", True))
-        self.gripper_port: str = robot_cfg["gripper_port"]
+        self.gripper_port: int = int(robot_cfg.get("gripper_port", 63352))
         self.gripper_open: int = int(robot_cfg.get("gripper_open", 0))
-        self.gripper_close: int = int(robot_cfg.get("gripper_close", 1000))
+        self.gripper_close: int = int(robot_cfg.get("gripper_close", 255))
+        self.gripper_force: int = int(robot_cfg.get("gripper_force", 255))
+        self.gripper_init_open: bool = bool(
+            robot_cfg.get("gripper_init_open", False)
+        )
+        self.gripper: dict[str, Any] = robot_cfg.get("gripper", {
+            "choice": "robotiq",
+            "robotiq": {
+                "ip": self.robot_ip,
+                "port": self.gripper_port,
+                "force": self.gripper_force,
+                "open": self.gripper_open,
+                "close": self.gripper_close,
+            },
+        })
         self.servo_speed: float = float(robot_cfg.get("servo_speed", 0.1))
         self.servo_accel: float = float(robot_cfg.get("servo_accel", 0.1))
         self.servo_lookahead_time: float = float(
@@ -145,6 +239,8 @@ class RecordConfig:
         self.save_meta_period: int = int(time_cfg.get("save_meta_period", 1))
 
         self.enable_cameras: bool = bool(camera_cfg.get("enable", True))
+        self.storage_width: int = int(camera_cfg.get("storage_width", 854))
+        self.storage_height: int = int(camera_cfg.get("storage_height", 480))
         self.wrist_camera: dict[str, Any] = camera_cfg["wrist"]
         self.exterior_camera: dict[str, Any] = camera_cfg["exterior"]
 
@@ -176,13 +272,13 @@ def main(record_cfg: RecordConfig):
     robot_config = UR5eConfig(
         robot_ip=record_cfg.robot_ip,
         enable_gripper=record_cfg.enable_gripper,
-        gripper_port=record_cfg.gripper_port,
-        gripper_open=record_cfg.gripper_open,
-        gripper_close=record_cfg.gripper_close,
+        gripper=record_cfg.gripper,
+        gripper_init_open=record_cfg.gripper_init_open,
         servo_speed=record_cfg.servo_speed,
         servo_accel=record_cfg.servo_accel,
         servo_lookahead_time=record_cfg.servo_lookahead_time,
         servo_gain=record_cfg.servo_gain,
+        control_mode="joint",
         control_period_s=1.0 / record_cfg.fps,
         cameras=camera_config,
     )
@@ -194,6 +290,9 @@ def main(record_cfg: RecordConfig):
     obs_features = hw_to_dataset_features(robot.observation_features,
                                           "observation",
                                           use_video=True)
+    obs_features = update_observation_image_feature_shapes(
+        obs_features, record_cfg.storage_height, record_cfg.storage_width
+    )
     dataset_features = {**action_features, **obs_features}
 
     if record_cfg.resume:
@@ -218,8 +317,13 @@ def main(record_cfg: RecordConfig):
     _, events = init_keyboard_listener()
     init_rerun(session_name="recording")
 
-    teleop_action_processor, robot_action_processor, robot_observation_processor = (
+    teleop_action_processor, robot_action_processor, robot_observation_processor_base = (
         make_default_processors())
+    
+    # Override robot_observation_processor with image resizing
+    robot_observation_processor = make_robot_observation_processor_with_resize(
+        storage_size=(record_cfg.storage_height, record_cfg.storage_width)
+    )
 
     robot.connect()
     teleop.connect()
@@ -243,6 +347,9 @@ def main(record_cfg: RecordConfig):
                 move_slow=True,
             )
 
+            robot.send_action(build_gripper_action(record_cfg.gripper_init_open))
+            time.sleep(0.5)
+
             input("请在确认机械臂移动到初始位姿后，调整遥操臂基本匹配机械臂的姿势，然后按 Enter 进行校准...\n")
             teleop.device.reset_smoothing()
             teleop.calibrate_delta()
@@ -252,7 +359,7 @@ def main(record_cfg: RecordConfig):
             if record_cfg.close_gripper_before_recording:
                 if record_cfg.enable_gripper:
                     input("你已启动录制前关闭夹爪，请按 Enter 闭合夹爪...\n")
-                    robot._gripper.set_pos(0)
+                    robot.send_action({"gripper_position": 1.0})
                 else:
                     logging.warning(
                         "close_gripper_before_recording is enabled, but gripper control is disabled."

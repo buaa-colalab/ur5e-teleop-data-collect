@@ -19,18 +19,10 @@ from lerobot.teleoperators.teleoperator import Teleoperator
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
 from .config_teleop import UR5eTeleopConfig
+from .pose_utils import format_python_list
 
 KEYBOARD_POLL_SECONDS = 0.1
 logger = logging.getLogger(__name__)
-
-
-def _format_python_list(values: np.ndarray) -> str:
-    return np.array2string(
-        values,
-        precision=4,
-        separator=", ",
-        max_line_width=100000,
-    )
 
 
 class KeyMonitor:
@@ -189,11 +181,20 @@ class UR5eTeleop(Teleoperator):
         self.delta: np.ndarray | None = None
         self.sync_enabled = True
         self.gripper_position = 0.0 if not config.enable_gripper else 1.0
+        self.last_tcp_pose = None
 
     @property
     def action_features(self) -> dict:
         features = {f"joint_{idx}.pos": float for idx in range(1, 7)}
-        features["gripper_position"] = float
+        features.update({
+            "tcp_pose.x": float,
+            "tcp_pose.y": float,
+            "tcp_pose.z": float,
+            "tcp_pose.roll": float,
+            "tcp_pose.pitch": float,
+            "tcp_pose.yaw": float,
+            "gripper_position": float,
+        })
         return features
 
     @property
@@ -254,6 +255,7 @@ class UR5eTeleop(Teleoperator):
             )
 
         self.delta = robot_q - self.joint_coef * teleoperator_q
+        self.last_tcp_pose = self.get_robot_tcp_pose()
         logger.info(
             "Teleop delta recalibrated: %s", np.array2string(self.delta, precision=4)
         )
@@ -288,12 +290,12 @@ class UR5eTeleop(Teleoperator):
         if robot_q is None:
             print("joint: unavailable")
         else:
-            print(f"joint = {_format_python_list(robot_q)}")
+            print(f"joint = {format_python_list(robot_q)}")
 
         if tcp_pose is None:
             print("tcp:   unavailable")
         else:
-            print(f"tcp = {_format_python_list(tcp_pose)}")
+            print(f"tcp = {format_python_list(tcp_pose)}")
         print("================================\n")
 
     def keymap_lines(self) -> list[str]:
@@ -341,12 +343,26 @@ class UR5eTeleop(Teleoperator):
         else:
             target_joint = robot_q
 
+        # Get current TCP pose from robot
+        tcp_pose = self.get_robot_tcp_pose()
+        if tcp_pose is None:
+            # Fallback to last known TCP pose if current is unavailable
+            tcp_pose = self.last_tcp_pose if self.last_tcp_pose is not None else np.zeros(6)
+
         action_dict = {
             f"joint_{idx + 1}.pos": float(target_joint[idx]) for idx in range(6)
         }
-        action_dict["gripper_position"] = (
-            self.gripper_position if self.config.enable_gripper else 0.0
-        )
+        action_dict.update({
+            "tcp_pose.x": float(tcp_pose[0]),
+            "tcp_pose.y": float(tcp_pose[1]),
+            "tcp_pose.z": float(tcp_pose[2]),
+            "tcp_pose.roll": float(tcp_pose[3]),
+            "tcp_pose.pitch": float(tcp_pose[4]),
+            "tcp_pose.yaw": float(tcp_pose[5]),
+            "gripper_position": (
+                self.gripper_position if self.config.enable_gripper else 0.0
+            ),
+        })
         return action_dict
 
     def disconnect(self) -> None:
